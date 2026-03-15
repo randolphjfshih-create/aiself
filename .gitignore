@@ -1,0 +1,6 @@
+.streamlit/secrets.toml
+storage/
+my_soul/
+__pycache__/
+*.pyc
+.env
