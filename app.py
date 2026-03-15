@@ -381,21 +381,107 @@ def file_to_text(uploaded_file):
 # ─── Build in-memory index ────────────────────────────────────────────────────
 
 def build_index(texts: dict):
-    """Build LlamaIndex VectorStoreIndex from dict of {filename: text}."""
-    from llama_index.core import VectorStoreIndex, Document, Settings
-    from llama_index.llms.openai import OpenAI
-    from llama_index.embeddings.openai import OpenAIEmbedding
+    """
+    Build an in-memory vector index using OpenAI embeddings directly,
+    bypassing llama-index Document/pydantic to avoid Python 3.14 compat issues.
+    """
+    import openai
+    import json, math
 
-    Settings.llm = OpenAI(model="gpt-4o", temperature=0.2, system_prompt=SYSTEM_PROMPT)
-    Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
+    client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
 
-    documents = [
-        Document(text=text, metadata={"file_name": fname})
-        for fname, text in texts.items()
-        if text.strip()
+    # Split each text into chunks (~800 chars with overlap)
+    def chunk_text(text, size=800, overlap=100):
+        chunks = []
+        start = 0
+        while start < len(text):
+            end = min(start + size, len(text))
+            chunks.append(text[start:end])
+            start += size - overlap
+        return chunks
+
+    # Build chunk list with metadata
+    all_chunks = []
+    for fname, text in texts.items():
+        for i, chunk in enumerate(chunk_text(text)):
+            if chunk.strip():
+                all_chunks.append({"text": chunk, "file_name": fname, "chunk_id": i})
+
+    if not all_chunks:
+        raise ValueError("沒有可索引的內容")
+
+    # Batch embed (max 100 per request)
+    def embed_batch(batch):
+        texts_only = [c["text"] for c in batch]
+        resp = client.embeddings.create(
+            model="text-embedding-3-small",
+            input=texts_only,
+        )
+        return [item.embedding for item in resp.data]
+
+    batch_size = 100
+    embeddings = []
+    for i in range(0, len(all_chunks), batch_size):
+        batch = all_chunks[i:i+batch_size]
+        embeddings.extend(embed_batch(batch))
+
+    # Attach embeddings
+    for chunk, emb in zip(all_chunks, embeddings):
+        chunk["embedding"] = emb
+
+    return {"chunks": all_chunks, "client": client}
+
+
+def query_index(index: dict, question: str, top_k: int = 5) -> str:
+    """Query our custom in-memory index."""
+    import math
+
+    client = index["client"]
+    chunks = index["chunks"]
+
+    # Embed the question
+    resp = client.embeddings.create(
+        model="text-embedding-3-small",
+        input=[question],
+    )
+    q_emb = resp.data[0].embedding
+
+    # Cosine similarity
+    def cosine(a, b):
+        dot = sum(x*y for x, y in zip(a, b))
+        na  = math.sqrt(sum(x*x for x in a))
+        nb  = math.sqrt(sum(x*x for x in b))
+        return dot / (na * nb + 1e-9)
+
+    scored = sorted(chunks, key=lambda c: cosine(c["embedding"], q_emb), reverse=True)
+    top    = scored[:top_k]
+
+    # Build context
+    context_parts = []
+    sources = set()
+    for c in top:
+        snippet = f"[來源：{c['file_name']}]\n{c['text']}"
+        context_parts.append(snippet)
+        sources.add(c["file_name"])
+    context = "\n\n---\n\n".join(context_parts)
+
+    # Call GPT-4o
+    user_msg = "以下是從你的個人資料中找到的相關內容：\n\n" + context + "\n\n請根據以上資料回答這個問題：" + question
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": user_msg},
     ]
-    index = VectorStoreIndex.from_documents(documents, show_progress=False)
-    return index
+    completion = client.chat.completions.create(
+        model="gpt-4o",
+        messages=messages,
+        temperature=0.2,
+    )
+    answer = completion.choices[0].message.content
+
+    if sources:
+        answer += "\n\n---\n\ud83d\udcce **引用來源：** " + "、".join(sorted(sources))
+
+    return answer
 
 
 # ─── Session state init ───────────────────────────────────────────────────────
@@ -612,22 +698,10 @@ else:
             unsafe_allow_html=True,
         )
 
+
         with st.spinner("正在回溯你的記憶…"):
             try:
-                qe = st.session_state.index.as_query_engine(
-                    similarity_top_k=5,
-                    response_mode="compact",
-                )
-                response = qe.query(prompt)
-                answer = str(response)
-
-                if hasattr(response, "source_nodes") and response.source_nodes:
-                    sources = list({
-                        n.metadata.get("file_name", "未知來源")
-                        for n in response.source_nodes
-                    })
-                    answer += "\n\n---\n📎 **引用來源：** " + "、".join(sources)
-
+                answer = query_index(st.session_state.index, prompt)
             except Exception as e:
                 answer = f"⚠️ 查詢失敗：{e}"
 
