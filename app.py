@@ -380,26 +380,21 @@ def file_to_text(uploaded_file):
 
 # ─── Build in-memory index ────────────────────────────────────────────────────
 
-def build_index(texts: dict[str, str]):
+def build_index(texts: dict):
     """Build LlamaIndex VectorStoreIndex from dict of {filename: text}."""
-    from llama_index import VectorStoreIndex, ServiceContext, Document
-    from llama_index.llms import OpenAI
-    from llama_index.embeddings import OpenAIEmbedding
+    from llama_index.core import VectorStoreIndex, Document, Settings
+    from llama_index.llms.openai import OpenAI
+    from llama_index.embeddings.openai import OpenAIEmbedding
 
-    llm = OpenAI(model="gpt-4o", temperature=0.2, system_prompt=SYSTEM_PROMPT)
-    embed_model = OpenAIEmbedding()
-    service_context = ServiceContext.from_defaults(llm=llm, embed_model=embed_model)
+    Settings.llm = OpenAI(model="gpt-4o", temperature=0.2, system_prompt=SYSTEM_PROMPT)
+    Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
 
     documents = [
         Document(text=text, metadata={"file_name": fname})
         for fname, text in texts.items()
         if text.strip()
     ]
-    index = VectorStoreIndex.from_documents(
-        documents,
-        service_context=service_context,
-        show_progress=False,
-    )
+    index = VectorStoreIndex.from_documents(documents, show_progress=False)
     return index
 
 
