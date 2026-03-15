@@ -1,0 +1,7 @@
+# Soul Mirror — 雲端版依賴
+llama-index==0.8.42
+llama-index-llms-openai
+llama-index-embeddings-openai
+pypdf==5.3.1
+streamlit>=1.35.0
+openai>=1.30.0
