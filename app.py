@@ -391,7 +391,7 @@ def build_index(texts: dict):
     client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
 
     # Split each text into chunks (~800 chars with overlap)
-    def chunk_text(text, size=800, overlap=100):
+    def chunk_text(text, size=500, overlap=50):
         chunks = []
         start = 0
         while start < len(text):
@@ -410,20 +410,46 @@ def build_index(texts: dict):
     if not all_chunks:
         raise ValueError("沒有可索引的內容")
 
-    # Batch embed (max 100 per request)
-    def embed_batch(batch):
-        texts_only = [c["text"] for c in batch]
-        resp = client.embeddings.create(
-            model="text-embedding-3-small",
-            input=texts_only,
-        )
-        return [item.embedding for item in resp.data]
+    # Batch embed with rate-limit retry
+    import time
 
-    batch_size = 100
+    def embed_batch(batch, retries=5):
+        texts_only = [c["text"] for c in batch]
+        for attempt in range(retries):
+            try:
+                resp = client.embeddings.create(
+                    model="text-embedding-3-small",
+                    input=texts_only,
+                )
+                return [item.embedding for item in resp.data]
+            except Exception as e:
+                err = str(e)
+                if "rate_limit" in err or "429" in err:
+                    # 從錯誤訊息解析等待時間，預設 60 秒
+                    wait = 60
+                    import re
+                    m = re.search(r"try again in ([\d\.]+)s", err)
+                    if m:
+                        wait = float(m.group(1)) + 1
+                    else:
+                        m = re.search(r"try again in (\d+)ms", err)
+                        if m:
+                            wait = int(m.group(1)) / 1000 + 1
+                    if attempt < retries - 1:
+                        time.sleep(wait)
+                        continue
+                raise
+        return []
+
+    # 縮小批次大小，降低每次 token 消耗
+    batch_size = 20
     embeddings = []
     for i in range(0, len(all_chunks), batch_size):
         batch = all_chunks[i:i+batch_size]
         embeddings.extend(embed_batch(batch))
+        # 批次間小停頓，避免連續觸發限制
+        if i + batch_size < len(all_chunks):
+            time.sleep(0.3)
 
     # Attach embeddings
     for chunk, emb in zip(all_chunks, embeddings):
