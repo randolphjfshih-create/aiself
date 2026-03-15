@@ -86,6 +86,17 @@ try:
 except Exception:
     OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
+def safe_text(text: str) -> str:
+    """確保文字可安全放入 HTML，處理編碼與特殊字元。"""
+    if not isinstance(text, str):
+        text = str(text)
+    # encode to utf-8 then back, replacing unmappable chars
+    text = text.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+    # Escape HTML special chars except we allow markdown-ish content
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return text
+
+
 SYSTEM_PROMPT = """你是使用者的「數位思想代理人」。
 
 你的角色：
@@ -390,7 +401,15 @@ def build_index(texts: dict):
 
     client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
 
-    # Split each text into chunks (~800 chars with overlap)
+    # 用內容 hash 當快取 key，相同內容不重複 embed
+    import hashlib
+    cache_key = hashlib.md5(json.dumps(sorted(texts.keys())).encode()).hexdigest()
+    if "embed_cache" not in st.session_state:
+        st.session_state.embed_cache = {}
+    if cache_key in st.session_state.embed_cache:
+        return st.session_state.embed_cache[cache_key]
+
+    # Split each text into chunks (~500 chars with overlap)
     def chunk_text(text, size=500, overlap=50):
         chunks = []
         start = 0
@@ -455,7 +474,9 @@ def build_index(texts: dict):
     for chunk, emb in zip(all_chunks, embeddings):
         chunk["embedding"] = emb
 
-    return {"chunks": all_chunks, "client": client}
+    result = {"chunks": all_chunks, "client": client}
+    st.session_state.embed_cache[cache_key] = result
+    return result
 
 
 def query_index(index: dict, question: str, top_k: int = 5) -> str:
@@ -712,7 +733,7 @@ else:
         role_label = "你" if msg["role"] == "user" else "思想代理人"
         css_class  = "user" if msg["role"] == "user" else "assistant"
         st.markdown(
-            f'<div class="chat-bubble {css_class}"><div class="chat-label">{role_label}</div>{msg["content"]}</div>',
+            f'<div class="chat-bubble {css_class}"><div class="chat-label">{role_label}</div>{safe_text(msg["content"])}</div>',
             unsafe_allow_html=True,
         )
 
@@ -720,7 +741,7 @@ else:
     if prompt := st.chat_input("問問過去的自己…"):
         st.session_state.messages.append({"role": "user", "content": prompt})
         st.markdown(
-            f'<div class="chat-bubble user"><div class="chat-label">你</div>{prompt}</div>',
+            f'<div class="chat-bubble user"><div class="chat-label">你</div>{safe_text(prompt)}</div>',
             unsafe_allow_html=True,
         )
 
@@ -733,6 +754,6 @@ else:
 
         st.session_state.messages.append({"role": "assistant", "content": answer})
         st.markdown(
-            f'<div class="chat-bubble assistant"><div class="chat-label">思想代理人</div>{answer}</div>',
+            f'<div class="chat-bubble assistant"><div class="chat-label">思想代理人</div>{safe_text(answer)}</div>',
             unsafe_allow_html=True,
         )
