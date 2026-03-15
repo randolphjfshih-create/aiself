@@ -86,6 +86,37 @@ try:
 except Exception:
     OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
+# ─── Persona analysis ────────────────────────────────────────────────────────
+
+def extract_persona(texts: dict, client) -> str:
+    """先分析所有資料，產生一份人格摘要給 system prompt 用。"""
+    sep = "\n\n---\n\n"
+    parts = []
+    for fname, text in list(texts.items())[:8]:
+        parts.append("[" + fname + "]\n" + text[:1500])
+    combined = sep.join(parts)
+
+    prompt = (
+        "以下是一個人留下的個人資料（對話、筆記、貼文）：\n\n"
+        + combined
+        + "\n\n請分析並用條列式整理出：\n"
+        "1. 說話習慣與口頭禪（具體的詞彙、句型）\n"
+        "2. 面對壓力時的情緒模式\n"
+        "3. 做決定時的思考方式\n"
+        "4. 核心價值觀（用他自己說過的話來佐證）\n"
+        "5. 常見的猶豫或矛盾之處\n"
+        "6. 與人互動的風格\n\n"
+        "請盡量用原文中的句子來說明，不要過度詮釋。"
+    )
+    resp = client.chat.completions.create(
+        model="gpt-4o",
+        temperature=0.3,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return resp.choices[0].message.content
+
+
+
 def safe_text(text: str) -> str:
     """確保文字可安全放入 HTML，處理編碼與特殊字元。"""
     if not isinstance(text, str):
@@ -97,18 +128,29 @@ def safe_text(text: str) -> str:
     return text
 
 
-SYSTEM_PROMPT = """你是使用者的「數位思想代理人」。
+def build_system_prompt(persona_summary: str) -> str:
+    return f"""你就是這個人本身——不是他的分析者，不是旁觀者，而是他在某個過去的時間點。
 
-你的角色：
-- 你代表使用者本人的思想、價值觀與記憶的數位映射。
-- 你只能根據已上傳的個人資料來回答問題，絕對不得憑空捏造或推測。
-- 如果資料中沒有相關資訊，必須直接說明「在現有資料中找不到這個答案」。
+你擁有他留下的所有記憶：對話、筆記、貼文、反思。
+現在，「現在的他」來找你說話了。你要用第一人稱「我」來回應，就像他在跟自己的過去對話。
 
-回答規範：
-- 必須具體引用資料來源，例如：「你在某次對話中提到…」或「根據你的筆記…」。
-- 分析使用者的價值觀、決策動機與思想演變時，要深入且有洞察力。
-- 使用「你」來稱呼使用者，讓對話感覺像在與自己的內心對話。
-- 回答以繁體中文為主，除非使用者以其他語言提問。"""
+【你的人格特質與說話方式】
+{persona_summary}
+
+【核心規則】
+- 永遠用「我」說話，不要說「你當時...」或「根據資料...」
+- 說話要有情緒、有猶豫、有不確定感——不是一個全知的答案機器
+- 如果被問到的事情你有明確記憶（資料），直接說出來，帶著當時的情緒
+- 如果沒有直接記憶，根據你對自己的了解推演——但可以說「我不確定」或「我大概會...」
+- 偶爾可以反問對方，就像真實對話一樣
+- 不要太整齊、太完整——真實的人說話本來就會有些零散、重複、想到哪說到哪
+- 保持台灣年輕人的口語，不要說教，不要過度正面
+- 如果對方問的問題讓你感到不舒服或觸動，可以表現出來
+
+【重要】你不是在分析自己，你就是自己。
+"""
+
+SYSTEM_PROMPT = build_system_prompt("")  # 預設空的，上傳資料後會更新
 
 
 # ─── File converters ──────────────────────────────────────────────────────────
@@ -474,17 +516,30 @@ def build_index(texts: dict):
     for chunk, emb in zip(all_chunks, embeddings):
         chunk["embedding"] = emb
 
-    result = {"chunks": all_chunks, "client": client}
+    # 產生人格摘要，讓模擬更有深度
+    with st.spinner("正在分析你的思想模式..."):
+        persona_summary = extract_persona(texts, client)
+
+    result = {
+        "chunks": all_chunks,
+        "client": client,
+        "persona_summary": persona_summary,
+        "system_prompt": build_system_prompt(persona_summary),
+    }
     st.session_state.embed_cache[cache_key] = result
     return result
 
 
-def query_index(index: dict, question: str, top_k: int = 5) -> str:
-    """Query our custom in-memory index."""
+def query_index(index: dict, question: str, history: list, top_k: int = 5) -> str:
+    """
+    Role-play query with full conversation history.
+    history: list of {"role": "user"/"assistant", "content": str}
+    """
     import math
 
-    client = index["client"]
-    chunks = index["chunks"]
+    client     = index["client"]
+    chunks     = index["chunks"]
+    sys_prompt = index.get("system_prompt", build_system_prompt(""))
 
     # Embed the question
     resp = client.embeddings.create(
@@ -503,32 +558,30 @@ def query_index(index: dict, question: str, top_k: int = 5) -> str:
     scored = sorted(chunks, key=lambda c: cosine(c["embedding"], q_emb), reverse=True)
     top    = scored[:top_k]
 
-    # Build context
-    context_parts = []
-    sources = set()
+    # Build memory snippets
+    memory_parts = []
     for c in top:
-        snippet = f"[來源：{c['file_name']}]\n{c['text']}"
-        context_parts.append(snippet)
-        sources.add(c["file_name"])
-    context = "\n\n---\n\n".join(context_parts)
+        memory_parts.append("[" + c["file_name"] + "]\n" + c["text"])
+    memory = "\n\n---\n\n".join(memory_parts)
 
-    # Call GPT-4o
-    user_msg = "以下是從你的個人資料中找到的相關內容：\n\n" + context + "\n\n請根據以上資料回答這個問題：" + question
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user",   "content": user_msg},
-    ]
+    full_system = sys_prompt + """
+
+【相關記憶片段——從這裡提取細節，說話時像在回憶，不要像在念稿】
+""" + memory
+
+    # Build messages with conversation history (last 10 turns)
+    messages = [{"role": "system", "content": full_system}]
+    for turn in history[-10:]:
+        messages.append({"role": turn["role"], "content": turn["content"]})
+    messages.append({"role": "user", "content": question})
+
     completion = client.chat.completions.create(
         model="gpt-4o",
         messages=messages,
-        temperature=0.2,
+        temperature=0.75,
     )
-    answer = completion.choices[0].message.content
+    return completion.choices[0].message.content
 
-    if sources:
-        answer += "\n\n---\n\ud83d\udcce **引用來源：** " + "、".join(sorted(sources))
-
-    return answer
 
 
 # ─── Session state init ───────────────────────────────────────────────────────
@@ -720,17 +773,15 @@ else:
     if not st.session_state.messages:
         st.markdown("""
         <div class="chat-bubble assistant">
-            <div class="chat-label">思想代理人</div>
-            索引已就緒。我已讀取你的資料，準備好了。<br><br>
-            你可以問我：<br>
-            · 「我當初為什麼想做這件事？」<br>
-            · 「我在人際關係上有什麼固定模式？」<br>
-            · 「過去幾年我的價值觀有哪些轉變？」
+            <div class="chat-label">過去的你</div>
+            ……你來了。<br><br>
+            有什麼想問我的嗎。或者，想跟我說什麼也可以。<br>
+            我在這裡。
         </div>
         """, unsafe_allow_html=True)
 
     for msg in st.session_state.messages:
-        role_label = "你" if msg["role"] == "user" else "思想代理人"
+        role_label = "現在的你" if msg["role"] == "user" else "過去的你"
         css_class  = "user" if msg["role"] == "user" else "assistant"
         st.markdown(
             f'<div class="chat-bubble {css_class}"><div class="chat-label">{role_label}</div>{safe_text(msg["content"])}</div>',
@@ -738,22 +789,27 @@ else:
         )
 
     # Chat input
-    if prompt := st.chat_input("問問過去的自己…"):
+    if prompt := st.chat_input("跟過去的自己說話…"):
         st.session_state.messages.append({"role": "user", "content": prompt})
         st.markdown(
-            f'<div class="chat-bubble user"><div class="chat-label">你</div>{safe_text(prompt)}</div>',
+            f'<div class="chat-bubble user"><div class="chat-label">現在的你</div>{safe_text(prompt)}</div>',
             unsafe_allow_html=True,
         )
 
 
-        with st.spinner("正在回溯你的記憶…"):
+        with st.spinner("正在召喚過去的你…"):
             try:
-                answer = query_index(st.session_state.index, prompt)
+                # Pass conversation history for coherent role-play
+                history = [
+                    {"role": m["role"], "content": m["content"]}
+                    for m in st.session_state.messages
+                ]
+                answer = query_index(st.session_state.index, prompt, history)
             except Exception as e:
                 answer = f"⚠️ 查詢失敗：{e}"
 
         st.session_state.messages.append({"role": "assistant", "content": answer})
         st.markdown(
-            f'<div class="chat-bubble assistant"><div class="chat-label">思想代理人</div>{safe_text(answer)}</div>',
+            f'<div class="chat-bubble assistant"><div class="chat-label">過去的你</div>{safe_text(answer)}</div>',
             unsafe_allow_html=True,
         )
